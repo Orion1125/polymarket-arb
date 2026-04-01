@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+.clawhub/
+skills/
 .env
 *.log
 *_state.json
