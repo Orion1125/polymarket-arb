@@ -36,6 +36,7 @@ def build_config(root: Path) -> PaperConfig:
         stop_loss_floor=0.50,
         reentry_floor=0.60,
         same_side_reentry_gap=0.05,
+        reentry_stop_loss_gap=0.05,
         min_minutes_left=10,
         final_minute_seconds=60,
         position_size=500.0,
@@ -120,6 +121,16 @@ class PriceSelectionTests(unittest.TestCase):
 
         sl_quote = simulate_market_sell(shares_to_sell=100.0, bids=[BookLevel(price=0.60, size=100.0)], fee_rate=0.0, exponent=1.0)
         self.assertEqual(should_trigger_stop_loss(config, position, {"yes": sl_quote}), 0.60)
+
+    def test_reentry_positions_have_five_cent_stop_loss(self):
+        config = build_config(Path("."))
+        position = {"side": "yes", "entry_kind": "reentry", "entry_effective_price": 0.65}
+
+        hold_quote = simulate_market_sell(shares_to_sell=100.0, bids=[BookLevel(price=0.61, size=100.0)], fee_rate=0.0, exponent=1.0)
+        self.assertIsNone(should_trigger_stop_loss(config, position, {"yes": hold_quote}))
+
+        stop_quote = simulate_market_sell(shares_to_sell=100.0, bids=[BookLevel(price=0.60, size=100.0)], fee_rate=0.0, exponent=1.0)
+        self.assertEqual(should_trigger_stop_loss(config, position, {"yes": stop_quote}), 0.60)
 
     def test_fee_exponent_prefers_crypto_tag(self):
         self.assertEqual(derive_fee_exponent(["sdk-import", "crypto", "fast"]), 1.0)

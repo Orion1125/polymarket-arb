@@ -304,6 +304,7 @@ class PaperConfig:
     stop_loss_floor: float
     reentry_floor: float
     same_side_reentry_gap: float
+    reentry_stop_loss_gap: float
     min_minutes_left: int
     final_minute_seconds: int
     position_size: float
@@ -335,6 +336,7 @@ class PaperConfig:
             stop_loss_floor=float(os.environ.get("CERTAINTY_STOP_LOSS_FLOOR", "0.50")),
             reentry_floor=float(os.environ.get("CERTAINTY_REENTRY_FLOOR", "0.60")),
             same_side_reentry_gap=float(os.environ.get("CERTAINTY_SAME_SIDE_REENTRY_GAP", "0.05")),
+            reentry_stop_loss_gap=float(os.environ.get("CERTAINTY_REENTRY_STOP_LOSS_GAP", "0.05")),
             min_minutes_left=int(os.environ.get("CERTAINTY_MIN_MINUTES_LEFT", "10")),
             final_minute_seconds=int(os.environ.get("CERTAINTY_FINAL_MINUTE_SECONDS", "60")),
             position_size=float(os.environ.get("CERTAINTY_POSITION_SIZE", "500")),
@@ -599,11 +601,15 @@ def should_trigger_stop_loss(
     position: dict[str, Any],
     sell_quotes: dict[str, SellQuote],
 ) -> Optional[float]:
-    if position.get("entry_kind") == "reentry":
-        return None
     quote = sell_quotes.get(position["side"])
     if not quote or quote.effective_price is None:
         return None
+    if position.get("entry_kind") == "reentry":
+        entry_effective_price = parse_float(position.get("entry_effective_price"))
+        if entry_effective_price is None:
+            return None
+        reentry_stop = max(entry_effective_price - config.reentry_stop_loss_gap, 0.0)
+        return quote.effective_price if quote.fill_ratio > 0 and quote.effective_price <= reentry_stop else None
     if config.stop_loss_floor <= quote.effective_price <= config.stop_loss:
         return quote.effective_price
     return None
@@ -1176,6 +1182,11 @@ class PolymarketPaperTrader:
             "opened_at": to_iso8601(utc_now()),
             "resolves_at": market["resolves_at"],
             "original_side": pending.get("original_side", side),
+            "stop_loss_trigger": (
+                max(float(quote.effective_price) - self.config.reentry_stop_loss_gap, 0.0)
+                if entry_kind == "reentry" and quote.effective_price is not None
+                else None
+            ),
         }
         self.state["active_market"] = market
         if entry_kind == "reentry":
@@ -1493,11 +1504,14 @@ class PolymarketPaperTrader:
         lines = [table, Text("")]
         if position:
             sell_quote = snapshot.sell_quotes.get(position["side"])
+            stop_text = f"SL {self.config.stop_loss_floor:.3f}-{self.config.stop_loss:.3f}"
+            if position.get("entry_kind") == "reentry":
+                stop_text = f"SL <= {format_price(parse_float(position.get('stop_loss_trigger')))}"
             lines.append(
                 Text(
                     f"Held {position['side'].upper()} exit mark: {format_percent(sell_quote.effective_price if sell_quote else None)}   "
                     f"TP >= {self.config.take_profit - self.config.take_profit_band:.3f}   "
-                    f"SL {self.config.stop_loss_floor:.3f}-{self.config.stop_loss:.3f}",
+                    f"{stop_text}",
                     style="bold cyan",
                 )
             )
