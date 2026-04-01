@@ -214,6 +214,7 @@ def default_state(starting_cash: float) -> dict[str, Any]:
         "current_position": None,
         "pending_reentry": None,
         "active_market": None,
+        "repeat_entry_market_id": None,
         "recent_logs": [],
         "updated_at": to_iso8601(utc_now()),
     }
@@ -451,6 +452,11 @@ def min_remaining_seconds(config: PaperConfig) -> int:
     return max(config.min_minutes_left * 60, config.final_minute_seconds)
 
 
+def can_take_initial_entry(config: PaperConfig, *, seconds_left: float, allow_repeat: bool) -> bool:
+    threshold = config.final_minute_seconds if allow_repeat else min_remaining_seconds(config)
+    return seconds_left >= threshold
+
+
 def simulate_market_buy(
     *,
     cash_budget: float,
@@ -573,8 +579,9 @@ def select_entry_candidate(
     buy_quotes: dict[str, BuyQuote],
     *,
     seconds_left: float,
+    allow_repeat: bool = False,
 ) -> Optional[tuple[str, float]]:
-    if seconds_left < min_remaining_seconds(config):
+    if not can_take_initial_entry(config, seconds_left=seconds_left, allow_repeat=allow_repeat):
         return None
     lower_bound = config.entry_target - config.entry_band
     upper_bound = config.entry_target + config.entry_band
@@ -1191,6 +1198,7 @@ class PolymarketPaperTrader:
         self.state["active_market"] = market
         if entry_kind == "reentry":
             self.state["pending_reentry"] = None
+        self.state["repeat_entry_market_id"] = None
 
         self.record_event(
             event_type="entry",
@@ -1262,8 +1270,13 @@ class PolymarketPaperTrader:
                 "last_stop_price": stop_price,
                 "resolves_at": position["resolves_at"],
             }
+            self.state["repeat_entry_market_id"] = None
+        elif reason.lower() == "tp":
+            self.state["pending_reentry"] = None
+            self.state["repeat_entry_market_id"] = position["market_id"]
         else:
             self.state["pending_reentry"] = None
+            self.state["repeat_entry_market_id"] = None
 
         self.state["current_position"] = None
         if reason.lower() in {"tp", "flatten"}:
@@ -1372,11 +1385,19 @@ class PolymarketPaperTrader:
                 return f"Re-entry candidate found on {side.upper()}."
             return "Watching for re-entry above the configured floor."
 
-        candidate = select_entry_candidate(self.config, buy_quotes, seconds_left=seconds_left)
+        allow_repeat = self.state.get("repeat_entry_market_id") == market["market_id"]
+        candidate = select_entry_candidate(
+            self.config,
+            buy_quotes,
+            seconds_left=seconds_left,
+            allow_repeat=allow_repeat,
+        )
         if candidate:
             side, _ = candidate
             self._execute_buy(market=market, side=side, quote=buy_quotes[side], entry_kind="initial")
             return f"Entry candidate found on {side.upper()}."
+        if allow_repeat and seconds_left < min_remaining_seconds(self.config):
+            return "Waiting for another 80c repeat entry in this interval."
         return "No entry signal right now."
 
     def snapshot(self) -> DashboardSnapshot:

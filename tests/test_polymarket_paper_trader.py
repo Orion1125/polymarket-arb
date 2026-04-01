@@ -100,6 +100,14 @@ class PriceSelectionTests(unittest.TestCase):
         chosen = select_entry_candidate(config, {"yes": yes_quote, "no": no_quote}, seconds_left=10 * 60)
         self.assertEqual(chosen, ("no", 0.79))
 
+    def test_repeat_initial_entry_is_allowed_after_tp_with_less_than_ten_minutes_left(self):
+        config = build_config(Path("."))
+        quote = simulate_market_buy(cash_budget=500.0, asks=[BookLevel(price=0.80, size=1000.0)], fee_rate=0.0, exponent=1.0)
+        blocked = select_entry_candidate(config, {"yes": quote}, seconds_left=5 * 60, allow_repeat=False)
+        allowed = select_entry_candidate(config, {"yes": quote}, seconds_left=5 * 60, allow_repeat=True)
+        self.assertIsNone(blocked)
+        self.assertEqual(allowed, ("yes", 0.80))
+
     def test_reentry_same_side_requires_gap(self):
         config = build_config(Path("."))
         pending = {"original_side": "yes", "last_stop_price": 0.60}
