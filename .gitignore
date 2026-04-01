@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+*.log
+*_state.json
+notification_queue.json
+notifications.log
+smoke_paper_state.json
+smoke_paper.log
+certainty_bot.log
+polymarket_paper_trader.log
