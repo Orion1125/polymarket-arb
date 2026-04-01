@@ -591,6 +591,17 @@ def select_entry_candidate(
     )
 
 
+def describe_entry_prices(buy_quotes: dict[str, BuyQuote]) -> str:
+    parts: list[str] = []
+    for side in ("yes", "no"):
+        quote = buy_quotes.get(side)
+        if not quote or quote.effective_price is None:
+            parts.append(f"{side.upper()} n/a")
+        else:
+            parts.append(f"{side.upper()} {quote.effective_price:.3f}")
+    return ", ".join(parts)
+
+
 def should_take_profit(
     config: PaperConfig,
     position: dict[str, Any],
@@ -1386,6 +1397,7 @@ class PolymarketPaperTrader:
             return "Watching for re-entry above the configured floor."
 
         allow_repeat = self.state.get("repeat_entry_market_id") == market["market_id"]
+        threshold_seconds = self.config.final_minute_seconds if allow_repeat else min_remaining_seconds(self.config)
         candidate = select_entry_candidate(
             self.config,
             buy_quotes,
@@ -1396,9 +1408,18 @@ class PolymarketPaperTrader:
             side, _ = candidate
             self._execute_buy(market=market, side=side, quote=buy_quotes[side], entry_kind="initial")
             return f"Entry candidate found on {side.upper()}."
+        if seconds_left < threshold_seconds:
+            if allow_repeat:
+                return f"Repeat entry window closed with {seconds_left:.1f}s left."
+            return f"Initial entry window closed with {seconds_left:.1f}s left."
         if allow_repeat and seconds_left < min_remaining_seconds(self.config):
             return "Waiting for another 80c repeat entry in this interval."
-        return "No entry signal right now."
+        lower_bound = self.config.entry_target - self.config.entry_band
+        upper_bound = self.config.entry_target + self.config.entry_band
+        return (
+            f"No entry: effective buy prices {describe_entry_prices(buy_quotes)} are outside "
+            f"{lower_bound:.3f}-{upper_bound:.3f}."
+        )
 
     def snapshot(self) -> DashboardSnapshot:
         now = utc_now()
