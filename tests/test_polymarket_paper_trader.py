@@ -11,6 +11,7 @@ from polymarket_paper_trader import (
     calculate_fee_usdc,
     choose_reference_price,
     derive_fee_exponent,
+    derive_fee_rate,
     filter_trade_log_entries,
     ratio_or_none,
     select_entry_candidate,
@@ -51,34 +52,34 @@ def build_config(root: Path) -> PaperConfig:
 
 
 class FeeAndFillTests(unittest.TestCase):
-    def test_fee_formula_uses_bps_and_rounding(self):
-        self.assertEqual(calculate_fee_usdc(100.0, 0.50, 1000, 1.0), 2.5)
+    def test_fee_formula_uses_market_fee_rate_and_rounding(self):
+        self.assertEqual(calculate_fee_usdc(100.0, 0.50, 0.072, 1.0), 0.9)
 
     def test_market_buy_charges_fee_in_shares(self):
         quote = simulate_market_buy(
             cash_budget=50.0,
             asks=[BookLevel(price=0.50, size=100.0)],
-            base_fee_bps=1000,
+            fee_rate=0.072,
             exponent=1.0,
         )
         self.assertEqual(quote.spent_cash, 50.0)
         self.assertEqual(quote.gross_shares, 100.0)
-        self.assertEqual(quote.fee_usdc, 2.5)
-        self.assertEqual(quote.fee_shares, 5.0)
-        self.assertEqual(quote.net_shares, 95.0)
-        self.assertAlmostEqual(quote.effective_price, 50.0 / 95.0)
+        self.assertEqual(quote.fee_usdc, 0.9)
+        self.assertEqual(quote.fee_shares, 1.8)
+        self.assertEqual(quote.net_shares, 98.2)
+        self.assertAlmostEqual(quote.effective_price, 50.0 / 98.2)
 
     def test_market_sell_charges_fee_in_cash(self):
         quote = simulate_market_sell(
             shares_to_sell=100.0,
             bids=[BookLevel(price=0.50, size=100.0)],
-            base_fee_bps=1000,
+            fee_rate=0.072,
             exponent=1.0,
         )
         self.assertEqual(quote.gross_proceeds, 50.0)
-        self.assertEqual(quote.fee_usdc, 2.5)
-        self.assertEqual(quote.net_proceeds, 47.5)
-        self.assertAlmostEqual(quote.effective_price, 0.475)
+        self.assertEqual(quote.fee_usdc, 0.9)
+        self.assertEqual(quote.net_proceeds, 49.1)
+        self.assertAlmostEqual(quote.effective_price, 0.491)
 
 
 class PriceSelectionTests(unittest.TestCase):
@@ -93,8 +94,8 @@ class PriceSelectionTests(unittest.TestCase):
 
     def test_entry_candidate_uses_lowest_qualifying_effective_price(self):
         config = build_config(Path("."))
-        yes_quote = simulate_market_buy(cash_budget=500.0, asks=[BookLevel(price=0.80, size=1000.0)], base_fee_bps=0, exponent=1.0)
-        no_quote = simulate_market_buy(cash_budget=500.0, asks=[BookLevel(price=0.79, size=1000.0)], base_fee_bps=0, exponent=1.0)
+        yes_quote = simulate_market_buy(cash_budget=500.0, asks=[BookLevel(price=0.80, size=1000.0)], fee_rate=0.0, exponent=1.0)
+        no_quote = simulate_market_buy(cash_budget=500.0, asks=[BookLevel(price=0.79, size=1000.0)], fee_rate=0.0, exponent=1.0)
         chosen = select_entry_candidate(config, {"yes": yes_quote, "no": no_quote}, seconds_left=10 * 60)
         self.assertEqual(chosen, ("no", 0.79))
 
@@ -102,11 +103,11 @@ class PriceSelectionTests(unittest.TestCase):
         config = build_config(Path("."))
         pending = {"original_side": "yes", "last_stop_price": 0.60}
 
-        too_early_same_side = simulate_market_buy(cash_budget=500.0, asks=[BookLevel(price=0.64, size=1000.0)], base_fee_bps=0, exponent=1.0)
-        below_floor_other_side = simulate_market_buy(cash_budget=500.0, asks=[BookLevel(price=0.59, size=1000.0)], base_fee_bps=0, exponent=1.0)
+        too_early_same_side = simulate_market_buy(cash_budget=500.0, asks=[BookLevel(price=0.64, size=1000.0)], fee_rate=0.0, exponent=1.0)
+        below_floor_other_side = simulate_market_buy(cash_budget=500.0, asks=[BookLevel(price=0.59, size=1000.0)], fee_rate=0.0, exponent=1.0)
         self.assertIsNone(select_reentry_candidate(config, pending, {"yes": too_early_same_side, "no": below_floor_other_side}))
 
-        same_side = simulate_market_buy(cash_budget=500.0, asks=[BookLevel(price=0.65, size=1000.0)], base_fee_bps=0, exponent=1.0)
+        same_side = simulate_market_buy(cash_budget=500.0, asks=[BookLevel(price=0.65, size=1000.0)], fee_rate=0.0, exponent=1.0)
         chosen = select_reentry_candidate(config, pending, {"yes": same_side, "no": below_floor_other_side})
         self.assertEqual(chosen, ("yes", 0.65))
 
@@ -114,14 +115,17 @@ class PriceSelectionTests(unittest.TestCase):
         config = build_config(Path("."))
         position = {"side": "yes", "entry_kind": "initial"}
 
-        tp_quote = simulate_market_sell(shares_to_sell=100.0, bids=[BookLevel(price=0.95, size=100.0)], base_fee_bps=0, exponent=1.0)
+        tp_quote = simulate_market_sell(shares_to_sell=100.0, bids=[BookLevel(price=0.95, size=100.0)], fee_rate=0.0, exponent=1.0)
         self.assertEqual(should_take_profit(config, position, {"yes": tp_quote}), 0.95)
 
-        sl_quote = simulate_market_sell(shares_to_sell=100.0, bids=[BookLevel(price=0.60, size=100.0)], base_fee_bps=0, exponent=1.0)
+        sl_quote = simulate_market_sell(shares_to_sell=100.0, bids=[BookLevel(price=0.60, size=100.0)], fee_rate=0.0, exponent=1.0)
         self.assertEqual(should_trigger_stop_loss(config, position, {"yes": sl_quote}), 0.60)
 
     def test_fee_exponent_prefers_crypto_tag(self):
         self.assertEqual(derive_fee_exponent(["sdk-import", "crypto", "fast"]), 1.0)
+
+    def test_fee_rate_prefers_crypto_tag(self):
+        self.assertEqual(derive_fee_rate(["sdk-import", "crypto", "fast"]), 0.072)
 
     def test_ratio_or_none_handles_zero_base(self):
         self.assertEqual(ratio_or_none(2.5, 10.0), 0.25)

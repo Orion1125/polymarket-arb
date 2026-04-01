@@ -42,6 +42,9 @@ FEE_EXPONENT_BY_TAG = {
     "mentions": 2.0,
     "general": 2.0,
 }
+FEE_RATE_BY_TAG = {
+    "crypto": 0.072,
+}
 
 
 class PaperTraderError(RuntimeError):
@@ -181,11 +184,18 @@ def derive_fee_exponent(tags: list[str]) -> float:
     return 1.0
 
 
-def calculate_fee_usdc(shares: float, price: float, base_fee_bps: int, exponent: float) -> float:
-    if shares <= 0 or price <= 0 or base_fee_bps <= 0:
+def derive_fee_rate(tags: list[str]) -> float:
+    lowered = {tag.lower() for tag in tags}
+    for tag, rate in FEE_RATE_BY_TAG.items():
+        if tag in lowered:
+            return rate
+    return 0.0
+
+
+def calculate_fee_usdc(shares: float, price: float, fee_rate: float, exponent: float) -> float:
+    if shares <= 0 or price <= 0 or fee_rate <= 0:
         return 0.0
-    fee_rate = base_fee_bps / 10_000
-    fee = shares * fee_rate * ((price * (1 - price)) ** exponent)
+    fee = shares * price * fee_rate * ((price * (1 - price)) ** exponent)
     rounded = round(fee + 1e-12, 5)
     return rounded if rounded >= 0.00001 else 0.0
 
@@ -443,7 +453,7 @@ def simulate_market_buy(
     *,
     cash_budget: float,
     asks: list[BookLevel],
-    base_fee_bps: int,
+    fee_rate: float,
     exponent: float,
 ) -> BuyQuote:
     remaining_cash = max(cash_budget, 0.0)
@@ -464,7 +474,7 @@ def simulate_market_buy(
         if shares <= 1e-9:
             continue
         cash_spent = shares * level.price
-        fee_usdc = calculate_fee_usdc(shares, level.price, base_fee_bps, exponent)
+        fee_usdc = calculate_fee_usdc(shares, level.price, fee_rate, exponent)
         fee_shares = min(shares, fee_usdc / level.price if level.price else 0.0)
 
         spent_cash += cash_spent
@@ -497,7 +507,7 @@ def simulate_market_sell(
     *,
     shares_to_sell: float,
     bids: list[BookLevel],
-    base_fee_bps: int,
+    fee_rate: float,
     exponent: float,
 ) -> SellQuote:
     remaining_shares = max(shares_to_sell, 0.0)
@@ -516,7 +526,7 @@ def simulate_market_sell(
         if shares <= 1e-9:
             continue
         gross = shares * level.price
-        fee_usdc = calculate_fee_usdc(shares, level.price, base_fee_bps, exponent)
+        fee_usdc = calculate_fee_usdc(shares, level.price, fee_rate, exponent)
         net = max(gross - fee_usdc, 0.0)
 
         filled_shares += shares
@@ -744,6 +754,8 @@ class SimmerFastMarketDiscovery:
         if not selected.get("polymarket_token_id") or not selected.get("polymarket_no_token_id"):
             return None
         tags = list(selected.get("tags") or [])
+        fee_rate = derive_fee_rate(tags)
+        fee_exponent = derive_fee_exponent(tags)
         return {
             "market_id": selected["id"],
             "question": selected.get("question"),
@@ -753,7 +765,8 @@ class SimmerFastMarketDiscovery:
             "yes_token_id": selected.get("polymarket_token_id"),
             "no_token_id": selected.get("polymarket_no_token_id"),
             "tags": tags,
-            "fee_exponent": derive_fee_exponent(tags),
+            "fee_rate": fee_rate,
+            "fee_exponent": fee_exponent,
             "is_live_now": bool(selected.get("is_live_now")),
         }
 
@@ -785,6 +798,9 @@ class SimmerFastMarketDiscovery:
         if not resolves_at:
             return None
         tags = ["polymarket", "crypto", "fast", f"fast-{window}"]
+        fee_schedule = dict(selected.get("feeSchedule") or {})
+        fee_rate = parse_float(fee_schedule.get("rate"))
+        fee_exponent = parse_float(fee_schedule.get("exponent"))
         return {
             "market_id": str(selected.get("id")),
             "question": selected.get("question"),
@@ -794,7 +810,9 @@ class SimmerFastMarketDiscovery:
             "yes_token_id": token_ids[0],
             "no_token_id": token_ids[1],
             "tags": tags,
-            "fee_exponent": derive_fee_exponent(tags),
+            "fee_bps": int(selected.get("takerBaseFee") or selected.get("makerBaseFee") or 0),
+            "fee_rate": fee_rate if fee_rate is not None else derive_fee_rate(tags),
+            "fee_exponent": fee_exponent if fee_exponent is not None else derive_fee_exponent(tags),
             "is_live_now": bool(selected.get("acceptingOrders")) and not bool(selected.get("closed")),
         }
 
@@ -1109,11 +1127,11 @@ class PolymarketPaperTrader:
     def _build_buy_quotes(self, market: dict[str, Any], books: dict[str, OrderBookView]) -> dict[str, BuyQuote]:
         wallet_cash = float((self.state.get("wallet") or {}).get("cash") or 0.0)
         cash_budget = min(self.config.position_size, wallet_cash)
-        fee_bps = int(market.get("fee_bps") or 0)
+        fee_rate = float(market.get("fee_rate") or 0.0)
         exponent = float(market.get("fee_exponent") or 1.0)
         return {
-            "yes": simulate_market_buy(cash_budget=cash_budget, asks=books["yes"].asks, base_fee_bps=fee_bps, exponent=exponent),
-            "no": simulate_market_buy(cash_budget=cash_budget, asks=books["no"].asks, base_fee_bps=fee_bps, exponent=exponent),
+            "yes": simulate_market_buy(cash_budget=cash_budget, asks=books["yes"].asks, fee_rate=fee_rate, exponent=exponent),
+            "no": simulate_market_buy(cash_budget=cash_budget, asks=books["no"].asks, fee_rate=fee_rate, exponent=exponent),
         }
 
     def _build_sell_quotes(self, market: dict[str, Any], books: dict[str, OrderBookView]) -> dict[str, SellQuote]:
@@ -1123,14 +1141,14 @@ class PolymarketPaperTrader:
         shares = float(position.get("shares") or 0.0)
         if shares <= 0:
             return {}
-        fee_bps = int(market.get("fee_bps") or 0)
+        fee_rate = float(market.get("fee_rate") or 0.0)
         exponent = float(market.get("fee_exponent") or 1.0)
         side = position["side"]
         return {
             side: simulate_market_sell(
                 shares_to_sell=shares,
                 bids=books[side].bids,
-                base_fee_bps=fee_bps,
+                fee_rate=fee_rate,
                 exponent=exponent,
             )
         }
@@ -1368,7 +1386,8 @@ class PolymarketPaperTrader:
             display_market = next_market
 
         if display_market:
-            display_market["fee_bps"] = self.market_data.get_fee_bps(display_market["yes_token_id"])
+            if not display_market.get("fee_bps"):
+                display_market["fee_bps"] = self.market_data.get_fee_bps(display_market["yes_token_id"])
             opens_at = parse_datetime(display_market.get("opens_at"))
             if opens_at and opens_at > expected_next_open:
                 schedule_gap_seconds = (opens_at - expected_next_open).total_seconds()
@@ -1538,7 +1557,11 @@ class PolymarketPaperTrader:
             )
         if snapshot.schedule_gap_seconds:
             info.add_row("Schedule Gap", f"{snapshot.schedule_gap_seconds:,.1f}s")
-        info.add_row("Fee", f"{market.get('fee_bps', 0)} bps, exponent {float(market.get('fee_exponent', 1.0)):.1f}")
+        info.add_row(
+            "Fee",
+            f"{market.get('fee_bps', 0)} bps, rate {float(market.get('fee_rate', 0.0)):.3f}, "
+            f"exponent {float(market.get('fee_exponent', 1.0)):.1f}",
+        )
         info.add_row("Tick / Min", f"{format_price(yes_book.tick_size if yes_book else None)} / {format_shares(yes_book.min_order_size if yes_book else None)}")
         info.add_row("Tags", ", ".join(market.get("tags") or []) or "-")
         info.add_row("Market ID", market["market_id"])
